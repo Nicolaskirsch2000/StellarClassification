@@ -1,0 +1,193 @@
+---
+title: "Stellar Observation Classification"
+author: "Nicolas Kirsch"
+date: "26/09/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+load("SkyClass.RData")
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(ggplot2)) install.packages("ggplot2", repos="http://cran.us.r-project.org")
+if(!require(cowplot)) install.packages("cowplot", repos="http://cran.us.r-project.org")
+if(!require(dslabs)) install.packages("dslabs", repos="http://cran.us.r-project.org")
+library(randomForest)
+sky <- read.csv("GalaxyStarsQuasars.csv")
+
+```
+
+# Introduction
+
+Telling which stellar object an observation corresponds to is a complicated task to do manually because an observation is composed of many different features (wavelength emissions, ). Researchers therefore have to compare the observed values for each feature to the standard values of every stellar object. It is therefore interesting to create a machine learning algorithm which would automatically classify observations according to the stellar object studied. 
+
+To a smaller scale, we tried to create a machine learning algorithm able to classify observations between stars, galaxies and quasars. To do so, we used the *"Sloan Digital Sky Survey DR14"* dataset. This dataset is composed of 10,000 observation of space. Every observation is composed of 17 features columns and one class column. The class column specifies whether the observed object is a star, a galaxy or a quasar. THe features were : "objid", "ra", "dec", "u", "g", "r", "i", "z", "run", "rerun", "camcol", "field", "specobjid", "redshift", "plate", "mjd", "fiberID". 
+
+"run", "rerun", "camcol", "field", "fiberID", "plate" are specification on the tools used to make the observation. "ra" and "dec" are the astronomical coordinates of the object. "u", "g", "r", "i", "z" are the intensity of different wavelengths observed. They follow the  Thuan-Gunn astronomic magnitude system. "mjd" is the date of the observation. "objID" is an identifier for the observation in the original databank. Finally, "redshift" is a physical quantity giving us insight on the distance separating the stellar object from earth.
+
+We tried to use different machine learning algorithm to predict the class from the 17 features of each observation to find out which one would give the best accuracy. Our objective was to obtain an accuracy of at least 0.99. 
+
+# Data Analysis and Model creation
+## Initital exploratory data analysis and filtering
+
+The first thing we wanted to know was whether the dataset was complete or if some values were missing. To do so we checked for NA values in every columns. 
+```{r NA}
+colSums(is.na(sky))
+```
+
+There were no missing values in any column. We therefore were able to proceed to data analysis and visualization
+
+\vskip 1.5cm
+
+We also wanted to find out the repartition of observation between the three classes.
+
+```{r classes, echo=FALSE, fig.height= 2, fig.align='center'}
+ggplot(sky, aes(class, fill = class)) + geom_bar()
+```
+The observations were mostly of galaxies and stars, with much less quasars observations.
+
+A key part of our classification algorithm was the features which we were going to use to classify the observations. This corresponded to the columns of the dataset (except class which is what we try to predict).
+
+```{r columns}
+colnames(sky)
+```
+However, the columns "objid" and "specobjid" are not relevant for our algorithm as they are identifiers from the original databank. Furthermore, the columns "run", "rerun", "camcol" and "field" depend on the camera used to make the observation and not on the observed object. They are not not giving useful informations on the object and will therefore not help to classify it. We therefore decided to filter all those columns. 
+
+```{r filtering}
+sky <- sky[,-c(1,9,10,11,12,13)]
+head(sky)
+```
+
+As only significant features were now remaining, we wanted to evaluated their distribustion for each class. We started with the redshift (a value giving us information on the distance of the object)
+
+```{r redshift, echo = FALSE, fig.height= 4}
+star_r <- sky %>% filter(class == 'STAR') %>% 
+  ggplot(aes(redshift))+ geom_histogram(bins = 30, color = "black") +ggtitle("Stars")
+galaxy_r <- sky %>% filter(class == 'GALAXY') %>% 
+  ggplot(aes(redshift))+ geom_histogram(bins = 30, color = "black") + ggtitle("Galaxies")
+qso_r <- sky %>% filter(class == 'QSO') %>% 
+  ggplot(aes(redshift))+ geom_histogram(bins = 30, color = "black") + ggtitle("Quasars")
+
+#Get the three graphs in a grid
+p <- plot_grid(star_r,galaxy_r,qso_r)
+title <- ggdraw() + draw_label("Redshift distribution for Stars , Galaxies and Quasars", fontface='bold')
+plot_grid(title, p, ncol=1, rel_heights=c(0.1, 1)) # rel_heights values control title margins
+```
+
+We saw that the magnitude of the redshift varied significantly from one class to the other (Stars around to 0.001, Galaxies 0.01 and Quasars 1). We deduced that there were significant variation in the distance to Earth between these observed objects, with stars being much closer than galaxies themselves closer than quasars. These variations also led us to think that redshift would be a useful predictor when classifying the observations between Stars, Galaxies and Quasars. 
+
+We then looked at the different wavelengths used to capture the observations (u, g, r, i, z)
+
+```{r ugriz, echo = FALSE, fig.align='center', fig.height=3.5}
+plot_grid(ggplot(sky, aes(u, fill = class)) + geom_density(alpha = 0.7), 
+          ggplot(sky, aes(g, fill = class)) + geom_density(alpha = 0.7),
+          ggplot(sky, aes(r, fill = class)) + geom_density(alpha = 0.7),
+          ggplot(sky, aes(i, fill = class)) + geom_density(alpha = 0.7),
+          ggplot(sky, aes(z, fill = class)) + geom_density(alpha = 0.7), 
+          ncol=2)
+```
+
+For these features we could also see significant variability in the distribution between classes and therefore decided to keep them as predictors. We had a set of useful predictors and we were ready to separate the dataset into training and test set to start creating our models.
+
+```{r data partition,results='hide', warning=FALSE}
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = sky$class, times = 1, p = 0.1, list = FALSE)
+train_set <- sky[-test_index,]
+test_set <- sky[test_index,]
+```
+
+\vskip 1cm
+
+## Random Classification
+
+The easiest model we could creat was a model randomly assigning an observation to a class, regardless of the predictors. To do so, we created a vector of the same length as the test_set, randomly assigning one of the three classes. 
+
+```{r random vector, results='hide'}
+random_classification <- as.factor(sample(c("GALAXY","STAR","QSO"),nrow(test_set),replace=TRUE))
+```
+
+Then, using a confusion matrix between this vector and the actual test set classes, we were able to obtain the accuracy of our model. The model's accuracy was **0.345**. This value is close to 1/3, which makes sense as there is three preditors. As one could have thought, randomly classifying the observations gave us a very poor accuracy, far from our objective. We stored this value in a table in which we would add the accuracies of the different models.
+
+```{r table create, echo = 'FALSE'}
+accuracy_random
+```
+
+
+## Classifying using KNN
+
+We then tried to ameliorate our model's accuracy using a KNN algorithm. As we saw during data exploration that the predictors varied strongly from one class to another but not as much inside a class, it made sense to use a model based on the similarity between the closest "neighbors". As KNN algorithm uses a tuning parameter k, we trained our algorithm on the trainset to get the k value maximising the accuracy of the model. 
+
+```{r knn train, results = 'hide',eval = FALSE, warning=FALSE}
+knn_model <- train(class ~ ., 
+                method='knn', 
+                data = train_set,
+                tuneGrid=data.frame(k=seq(0,200,20)))
+```
+
+We then used the optimised model on the test set to predict its classes. Creating a confusion matrix between the predicted and the actual classes, we obtained the accuracy of this model. This value was of **0.803** 
+
+```{r table knn, echo=FALSE}
+accuracy_knn
+```
+
+Simply using a KNN algorithm to classify the observations instead of randomly classifying them has a very strong impact on the accuracy as it increased by more than 100%. However it still was not the desired accuracy, so we continued testing other models.
+
+## QDA Classification
+
+We also saw by visualizing the different predictors that their distributions for each classes were somewhat normal. THerefore by making the assumption that all the predictors were multivariate normal, we were able to create a classification model based on Quadratic Discriminant Analysis. As for the KNN model, our first step was to train the model and the trainset 
+
+```{r qda train, eval = FALSE}
+train_qda <- train(class ~ ., method = "qda", data = train_set)
+```
+
+We used this model to predict the test set classes and obtain its accuracy from a confusion matrix between the predicted and actual classes of the test set. We obtained an accuracy of **0.981**.
+
+```{r table qda, echo = FALSE}
+accuracy_qda
+```
+
+This model is much more accurate, nearly attaining the 0.99 accuracy threshold. 
+
+## Decision tree Classification
+
+As our objective was to create a classification algorithm, it made sense to use a decision tree, also called classification tree. This algorithm uses a tuning parameter called cp, which makes its flexibility vary. To get the optimal version of the model, we trained it using the train set. 
+
+```{r train dt, eval = FALSE}
+train_dt <- train(class ~ ., method = "rpart",
+                  tuneGrid = data.frame(cp = seq(0.0, 0.1, len = 25)), 
+                  data = train_set)
+```
+
+Using the same methodology as the previous models, we found out that using classification trees made the accuracy of the model rise up to **0.989**.
+
+```{r dt table, echo = FALSE}
+accuracy_dt
+```
+
+We were nearly there, but still needed to ameliorate our model. 
+
+## Random Forest Classification
+
+As we had just used decision trees, the logical next step was to use random forests. To do so we had to load a new package, "RandomForest". Afterwards, we followed the same protocol, training the model on the train set and then predicting the classes of the test set using it. We then recuperated the accuracy from the confusion matrix between actual and predicted values. This model gave us an accuracy of **0.990**
+
+```{r rf table,echo=FALSE}
+accuracy_rf
+```
+
+The random forest model finally was sufficiently accurate to meet our accuracy threshold of 0.99. 
+
+# Results 
+
+```{r results, echo = FALSE}
+accuracy_table
+```
+
+From the table comparing the accuracy of the different models, we were able to say that the most accurate model was random forest, with a nearly perfect accuracy of 0.990.
+
+# Conclusion 
+
+In conclusion, our objective was to determinate which stellar object (stars, galaxies or quasars) corresponded to an observation. We wanted to classify the observations between these stellar objects. To do so our model first randomly classified the observation, but as the accuracy was very low, we decided to use K nearest neighbors and Quadratic Discriminant Analysis. These methods gave us much better results, but still not the accuracy we were looking for. We finally decided to use decision trees and random forests, resulting in the targetted accuracy of 0.99.
+
+Further to this project, it could be interesting to use similar models on larger datasets with more classes of stellar objects (supernovas, asteroids...) to see if the accuracy is still as high.
+
